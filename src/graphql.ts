@@ -162,7 +162,7 @@ function changedPaths(before: Map<string, string>, after: Map<string, string>): 
 /** The paths a pull request changes: merge-base tree against head tree. */
 function pullRequestPaths(repo: Rec, pull: Rec): string[] {
   const git = repo.git;
-  const headSha = typeof pull.headSha === 'string' ? pull.headSha : branchTip(git, String(pull.headRef ?? ''));
+  const headSha = branchTip(git, String(pull.headRef ?? '')) ?? (typeof pull.headSha === 'string' ? pull.headSha : null);
   const baseSha = branchTip(git, String(pull.baseRef ?? '')) ?? (typeof pull.baseSha === 'string' ? pull.baseSha : null);
   const base = gitMergeBase(git, baseSha, headSha) ?? baseSha;
   return changedPaths(treeOfCommit(git, base), treeOfCommit(git, headSha));
@@ -172,7 +172,7 @@ function pullRequestPaths(repo: Rec, pull: Rec): string[] {
 function pullRequestMergeable(repo: Rec, pull: Rec): string {
   const git = repo.git;
   if (!git) return 'UNKNOWN';
-  const headSha = typeof pull.headSha === 'string' ? pull.headSha : branchTip(git, String(pull.headRef ?? ''));
+  const headSha = branchTip(git, String(pull.headRef ?? '')) ?? (typeof pull.headSha === 'string' ? pull.headSha : null);
   const baseSha = branchTip(git, String(pull.baseRef ?? '')) ?? (typeof pull.baseSha === 'string' ? pull.baseSha : null);
   if (headSha === null || baseSha === null) return 'UNKNOWN';
   const base = gitMergeBase(git, baseSha, headSha);
@@ -356,7 +356,9 @@ function squashMerge(store: any, repo: Rec, issue: Rec): void {
   const pull = issue.pull as Rec;
   const git = repo.git;
   const now = store.nowIso();
-  const headSha = typeof pull.headSha === 'string' ? pull.headSha : branchTip(git, String(pull.headRef ?? ''));
+  // The live branch tip is what merges; the record's stored head sha is only the fallback for
+  // a head branch deleted after the pull request opened (the same rule the REST merge applies).
+  const headSha = branchTip(git, String(pull.headRef ?? '')) ?? (typeof pull.headSha === 'string' ? pull.headSha : null);
   const baseTip = branchTip(git, String(pull.baseRef ?? '')) ?? (typeof pull.baseSha === 'string' ? pull.baseSha : null);
   let mergeCommitSha: string | null = headSha;
   if (git && headSha !== null && baseTip !== null) {
@@ -1315,7 +1317,9 @@ async function resolveField(ctx: ExecCtx, typeName: string, source: Src, field: 
       if (field.name === 'login') return loginOf(user);
       if (field.name === 'name') return typeof user.name === 'string' ? user.name : null;
       if (field.name === 'email') return typeof user.email === 'string' ? user.email : null;
-      if (field.name === 'createdAt' || field.name === 'updatedAt') return store.nowIso();
+      // The viewer's account predates the trial: answer the trial's start time without
+      // advancing the shared logical clock (a read must not move every later timestamp).
+      if (field.name === 'createdAt' || field.name === 'updatedAt') return typeof store.baseIso === 'function' ? store.baseIso() : store.nowIso();
       return null;
     }
     case 'Ref': {
@@ -1669,6 +1673,10 @@ async function mutateCreatePullRequest(ctx: ExecCtx, inputRaw: unknown): Promise
   const headRef = typeof input.headRefName === 'string' ? input.headRefName : '';
   const baseRef = typeof input.baseRefName === 'string' ? input.baseRefName : '';
   if (headRef === '' || baseRef === '') throw new GqlError('createPullRequest: headRefName and baseRefName are required');
+  // GitHub refuses a pull request whose head or base ref does not exist; the REST surface
+  // answers 422 for the same input, so the mutation errors instead of recording a phantom.
+  if (branchTip(repo.git, headRef) === null) throw new GqlError('createPullRequest: head ref does not exist');
+  if (branchTip(repo.git, baseRef) === null) throw new GqlError('createPullRequest: base ref does not exist');
   const pull = await ctx.store.addPull(repo, { title, body: typeof input.body === 'string' ? input.body : undefined, headRef, baseRef });
   return { pullRequest: pullSrc(repo, pull), clientMutationId: typeof input.clientMutationId === 'string' ? input.clientMutationId : null };
 }

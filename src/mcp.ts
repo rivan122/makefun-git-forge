@@ -300,7 +300,9 @@ function squashMerge(store: any, repo: Rec, issue: Rec): void {
   const pull = issue.pull as Rec;
   const git = repo.git;
   const now = store.nowIso();
-  const headSha = typeof pull.headSha === 'string' ? pull.headSha : branchTip(git, String(pull.headRef ?? ''));
+  // The live branch tip is what merges; the record's stored head sha is only the fallback for
+  // a head branch deleted after the pull request opened (the same rule the REST merge applies).
+  const headSha = branchTip(git, String(pull.headRef ?? '')) ?? (typeof pull.headSha === 'string' ? pull.headSha : null);
   const baseTip = branchTip(git, String(pull.baseRef ?? '')) ?? (typeof pull.baseSha === 'string' ? pull.baseSha : null);
   let mergeCommitSha: string | null = headSha;
   if (git && headSha !== null && baseTip !== null) {
@@ -598,6 +600,11 @@ async function callTool(store: any, params: unknown): Promise<Rec> {
     case 'create_pull_request': {
       const repo = await repoFor(store, args);
       if (repo === null) return toolFailure('Not Found: the repository does not exist');
+      // The REST surface refuses a pull request whose head or base branch does not exist (422);
+      // the tool answers the same way instead of recording a pull request with no commits.
+      if (branchTip(repo.git, String(args.head)) === null || branchTip(repo.git, String(args.base)) === null) {
+        return toolFailure('Validation Failed: head or base branch does not exist');
+      }
       try {
         const pull = await store.addPull(repo, {
           title: String(args.title),
@@ -616,7 +623,10 @@ async function callTool(store: any, params: unknown): Promise<Rec> {
       const number = typeof args.pull_number === 'number' ? args.pull_number : Number(args.pull_number);
       const issue = repo.issues instanceof Map ? repo.issues.get(number) : undefined;
       if (!isRecord(issue) || !issue.isPull) return toolFailure('Not Found: the pull request does not exist');
-      if ((issue.pull as Rec)?.merged === true) return toolResult(pullView(issue));
+      // The REST merge answers 405 for a pull request that is already merged or closed; the
+      // tool surfaces the same refusal instead of reporting a second, phantom merge.
+      if ((issue.pull as Rec)?.merged === true) return toolFailure('Pull Request is not mergeable: already merged');
+      if (issue.state === 'closed') return toolFailure('Pull Request is not mergeable: closed');
       try {
         squashMerge(store, repo, issue);
       } catch (err) {

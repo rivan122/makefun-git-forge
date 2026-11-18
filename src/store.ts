@@ -89,6 +89,7 @@ const CLOCK_FALLBACK = '2026-11-14T06:30:00.000Z';
 
 export class Store {
   private clockMs: number;
+  private readonly baseMs: number;
   private repoSeq: number;
   private issueSeq: number;
   private commentSeq: number;
@@ -97,6 +98,7 @@ export class Store {
   constructor() {
     const envNow = Date.parse(process.env.MAKEFUN_TRIAL_NOW ?? '');
     this.clockMs = Number.isNaN(envNow) ? Date.parse(CLOCK_FALLBACK) : envNow;
+    this.baseMs = this.clockMs;
     this.repoSeq = 1;
     this.issueSeq = 1;
     this.commentSeq = 1;
@@ -113,6 +115,11 @@ export class Store {
   /** The current logical time in epoch seconds; does not advance the clock. */
   epochSec(): number {
     return Math.floor(this.clockMs / 1000);
+  }
+
+  /** The trial's starting time as an ISO string; never advances (for records that predate all activity). */
+  baseIso(): string {
+    return new Date(this.baseMs).toISOString();
   }
 
   /** The next global comment id (comments share one id space across repositories). */
@@ -167,6 +174,25 @@ export class Store {
   /** Remove a repository; true when one was there. */
   deleteRepo(owner: string, name: string): boolean {
     return this.repos.delete(this.key(owner, name));
+  }
+
+  /**
+   * Re-key a repository under a new name (a rename): the record keeps its id, issues and git
+   * store; only its map key, name and full_name move. False when the old name is absent or the
+   * new name is already taken by another repository of the same owner.
+   */
+  renameRepo(owner: string, oldName: string, newName: string): boolean {
+    const oldKey = this.key(owner, oldName);
+    const rec = this.repos.get(oldKey);
+    if (rec === undefined) return false;
+    if (oldName === newName) return true;
+    const newKey = this.key(owner, newName);
+    if (this.repos.has(newKey)) return false;
+    this.repos.delete(oldKey);
+    rec.name = newName;
+    rec.full_name = `${owner}/${newName}`;
+    this.repos.set(newKey, rec);
+    return true;
   }
 
   /** An owner's repositories, in creation order. */

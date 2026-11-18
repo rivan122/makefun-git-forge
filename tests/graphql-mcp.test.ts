@@ -649,6 +649,53 @@ let toolsList: any[] = [];
   eq(del.status, 200, 'mcp: DELETE answers 200');
 }
 
+// Audit regressions: the MCP tools refuse what the REST surface refuses — a pull request from a
+// branch that does not exist (REST answers 422) and a second merge of an already-merged pull
+// request (REST answers 405) — instead of recording phantom state with a success result.
+{
+  seedRepo('audit-mcp');
+  const ghost = await rpc({
+    jsonrpc: '2.0',
+    id: 'audit-ghost-pr',
+    method: 'tools/call',
+    params: { name: 'create_pull_request', arguments: { owner: OWNER, repo: 'audit-mcp', title: 'ghost', head: 'no-such-branch', base: 'main' } },
+  });
+  eq(ghost.body?.result?.isError, true, 'mcp: create_pull_request with a missing head branch is an error', ghost.body);
+  const real = await rpc({
+    jsonrpc: '2.0',
+    id: 'audit-real-pr',
+    method: 'tools/call',
+    params: { name: 'create_pull_request', arguments: { owner: OWNER, repo: 'audit-mcp', title: 'real audit pull', head: 'merge-branch', base: 'main' } },
+  });
+  ok(real.body?.result?.isError !== true, 'mcp: create_pull_request with real branches succeeds', real.body);
+  const number = JSON.parse(real.body?.result?.content?.[0]?.text ?? '{}')?.number;
+  ok(typeof number === 'number', 'mcp: the created pull request has a number', real.body);
+  const first = await rpc({
+    jsonrpc: '2.0',
+    id: 'audit-merge-1',
+    method: 'tools/call',
+    params: { name: 'merge_pull_request', arguments: { owner: OWNER, repo: 'audit-mcp', pull_number: number } },
+  });
+  ok(first.body?.result?.isError !== true, 'mcp: the first merge succeeds', first.body);
+  const second = await rpc({
+    jsonrpc: '2.0',
+    id: 'audit-merge-2',
+    method: 'tools/call',
+    params: { name: 'merge_pull_request', arguments: { owner: OWNER, repo: 'audit-mcp', pull_number: number } },
+  });
+  eq(second.body?.result?.isError, true, 'mcp: merging an already-merged pull request is an error', second.body);
+}
+
+// Audit regression: GraphQL createPullRequest errors when the head ref does not exist (the REST
+// surface answers 422 for the same input) instead of recording a pull request with no commits.
+{
+  const { body } = await gql(CREATE_PULL_REQUEST, {
+    input: { repositoryId: repoGlobalId, baseRefName: 'main', headRefName: 'no-such-branch', title: 'ghost over graphql' },
+  });
+  ok(Array.isArray(body?.errors) && body.errors.length > 0, 'graphql: createPullRequest with a missing head ref errors', body);
+  ok(body?.data?.createPullRequest === null || body?.data?.createPullRequest === undefined, 'graphql: no pull request payload for the ghost create', body);
+}
+
 server.close();
 console.log(`\n${checks - failures}/${checks} assertions passed`);
 if (failures > 0) process.exit(1);

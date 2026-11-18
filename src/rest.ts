@@ -762,9 +762,19 @@ async function routeRepo(
       if (typeof body.description === 'string') repo.description = body.description;
       if (typeof body.private === 'boolean') repo.private = body.private;
       if (typeof body.default_branch === 'string' && body.default_branch !== '') repo.default_branch = body.default_branch;
-      if (typeof body.name === 'string' && body.name !== '') {
-        repo.name = body.name;
-        repo.full_name = `${repo.owner}/${body.name}`;
+      if (typeof body.name === 'string' && body.name !== '' && body.name !== repo.name) {
+        if (typeof store.renameRepo === 'function') {
+          if (!store.renameRepo(owner, name, body.name)) {
+            reply(res, 422, {
+              message: 'Repository creation failed.',
+              errors: [{ resource: 'Repository', code: 'custom', field: 'name', message: 'name already exists on this account' }],
+            });
+            return true;
+          }
+        } else {
+          repo.name = body.name;
+          repo.full_name = `${repo.owner}/${body.name}`;
+        }
       }
       repo.updated_at = store.nowIso();
       reply(res, 200, repoJson(store, repo));
@@ -812,7 +822,9 @@ async function routeRepo(
       const perPage = Number.isFinite(perPageRaw) && perPageRaw > 0 ? Math.min(100, Math.floor(perPageRaw)) : 30;
       const pageRaw = Number(url.searchParams.get('page') ?? '1');
       const page = Number.isFinite(pageRaw) && pageRaw > 0 ? Math.floor(pageRaw) : 1;
-      const shas = historyOf(git, tip, page * perPage + 1);
+      // The full history, not a page-bounded prefix: paginate() derives the Link header's
+      // rel="last" from the array's length, so a truncated walk would understate the last page.
+      const shas = historyOf(git, tip, 100_000);
       const page2 = paginate(req, url, shas);
       reply(res, 200, page2.items.map((sha: string) => commitJson(git, sha)), page2.headers);
       return true;
@@ -984,10 +996,58 @@ async function routeGit(req: IncomingMessage, res: ServerResponse, store: Any, r
       reply(res, 201, { ref, object: { sha, type: 'commit' } });
       return true;
     }
+    if (rest.length === 1 && method === 'GET') {
+      const all = refNames(git)
+        .sort()
+        .map((ref) => ({ ref, object: { sha: refGet(git, ref) as string, type: 'commit' } }));
+      reply(res, 200, all);
+      return true;
+    }
     if (rest.length >= 2 && method === 'GET') {
       const ref = `refs/${rest.slice(1).join('/')}`;
       const sha = refGet(git, ref);
-      if (sha === null) return notFound(res);
+      if (sha !== null) {
+        reply(res, 200, { ref, object: { sha, type: 'commit' } });
+        return true;
+      }
+      // A namespace read (GET /git/refs/heads): every ref under the prefix, GitHub's list shape.
+      const under = refNames(git)
+        .filter((name) => name.startsWith(`${ref}/`))
+        .sort()
+        .map((name) => ({ ref: name, object: { sha: refGet(git, name) as string, type: 'commit' } }));
+      if (under.length > 0) {
+        reply(res, 200, under);
+        return true;
+      }
+      return notFound(res);
+    }
+    if (rest.length >= 2 && method === 'DELETE') {
+      const ref = `refs/${rest.slice(1).join('/')}`;
+      if (refGet(git, ref) === null) return notFound(res);
+      if (ref === `refs/heads/${repo.default_branch}`) {
+        fail(res, 422, 'Cannot delete the default branch.');
+        return true;
+      }
+      git.refs.delete(ref);
+      replyNoContent(res);
+      return true;
+    }
+    if (rest.length >= 2 && method === 'PATCH') {
+      const ref = `refs/${rest.slice(1).join('/')}`;
+      const current = refGet(git, ref);
+      if (current === null) return notFound(res);
+      const parsed = await readJsonBody(req);
+      if (!parsed.ok) return badJson(res);
+      const sha = typeof parsed.body.sha === 'string' ? parsed.body.sha : '';
+      if (commitOf(git, sha) === null) {
+        fail(res, 422, 'Reference could not be updated.');
+        return true;
+      }
+      if (parsed.body.force !== true && sha !== current && mergeBaseOf(git, current, sha) !== current) {
+        fail(res, 422, 'Reference could not be updated: not a fast-forward.');
+        return true;
+      }
+      refSet(git, ref, sha);
       reply(res, 200, { ref, object: { sha, type: 'commit' } });
       return true;
     }
@@ -1044,7 +1104,13 @@ async function routeGit(req: IncomingMessage, res: ServerResponse, store: Any, r
           entries.push({ path: entry.name, mode: entry.mode, type: entry.type === 'tree' ? 'tree' : 'blob', sha: entry.sha });
         }
       }
-      if (entries.length === 0 && commit === null && flatTree(git, treeSha).size === 0) return notFound(res);
+      // A stored tree with no entries is the empty tree: it exists, so it reads back as an
+      // empty listing. Only a sha that names no tree (or a non-tree object) is a 404.
+      if (entries.length === 0 && commit === null) {
+        const stored = typeof git.load === 'function' ? git.load(treeSha) : undefined;
+        const isTree = stored !== undefined ? stored.type === 'tree' : flatTree(git, treeSha).size > 0;
+        if (!isTree) return notFound(res);
+      }
       reply(res, 200, { sha: treeSha, tree: entries, truncated: false });
       return true;
     }
@@ -1081,6 +1147,22 @@ async function routeGit(req: IncomingMessage, res: ServerResponse, store: Any, r
     }
     const sha = makeCommitSha(git, body.tree, parents, body.message, line);
     reply(res, 201, commitJson(git, sha));
+    return true;
+  }
+
+  if (head === 'blobs' && rest.length === 2 && method === 'GET') {
+    const sha = rest[1] as string;
+    const stored = typeof git.load === 'function' ? git.load(sha) : undefined;
+    const data = stored !== undefined ? (stored.type === 'blob' ? stored.data : null) : loadData(git, sha);
+    if (data === null || data === undefined) return notFound(res);
+    reply(res, 200, { sha, size: data.length, encoding: 'base64', content: encodeB64(data) });
+    return true;
+  }
+
+  if (head === 'commits' && rest.length === 2 && method === 'GET') {
+    const sha = rest[1] as string;
+    if (commitOf(git, sha) === null) return notFound(res);
+    reply(res, 200, commitJson(git, sha));
     return true;
   }
 
@@ -1404,7 +1486,9 @@ async function routePulls(req: IncomingMessage, res: ServerResponse, store: Any,
     }
     const git = repo.git;
     const baseTip = branchTip(repo, pull.baseRef);
-    const headTip = branchTip(repo, pull.headRef);
+    // The head branch may have been deleted after the pull request opened; the pull request
+    // record keeps the head commit it was opened with, and that is what merges then.
+    const headTip = branchTip(repo, pull.headRef) ?? pull.headSha;
     if (baseTip === null || headTip === null) {
       fail(res, 405, 'Pull Request is not mergeable');
       return true;

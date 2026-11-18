@@ -312,6 +312,121 @@ async function main(): Promise<void> {
     check('pagination walked at least 4 pages', pages >= 4, `pages=${pages}`);
     check('pagination saw every repo', seen.size >= 36, `seen=${seen.size}`);
 
+    // Audit regressions: repository rename re-keys the store.
+    {
+      const created = await call('POST', '/api/v3/user/repos', { name: 'audit-rename' });
+      eq('rename fixture created', created.status, 201);
+      const renamed = await call('PATCH', `/api/v3/repos/${owner}/audit-rename`, { name: 'audit-renamed' });
+      eq('rename patch status', renamed.status, 200);
+      eq('rename patch name', renamed.body?.name, 'audit-renamed');
+      const getNew = await call('GET', `/api/v3/repos/${owner}/audit-renamed`);
+      eq('renamed repo reads under the new name', getNew.status, 200);
+      eq('renamed repo keeps its id', getNew.body?.id, created.body?.id);
+      const getOld = await call('GET', `/api/v3/repos/${owner}/audit-rename`);
+      eq('old name no longer resolves', getOld.status, 404);
+      const reuseOld = await call('POST', '/api/v3/user/repos', { name: 'audit-rename' });
+      eq('old name is free after a rename', reuseOld.status, 201);
+      const reuseNew = await call('POST', '/api/v3/user/repos', { name: 'audit-renamed' });
+      eq('new name is taken after a rename', reuseNew.status, 422);
+      const other = await call('POST', '/api/v3/user/repos', { name: 'audit-other' });
+      eq('rename collision fixture created', other.status, 201);
+      const collide = await call('PATCH', `/api/v3/repos/${owner}/audit-other`, { name: 'audit-renamed' });
+      eq('rename onto an existing name is a 422', collide.status, 422);
+      const stillThere = await call('GET', `/api/v3/repos/${owner}/audit-other`);
+      eq('failed rename leaves the repo under its old name', stillThere.status, 200);
+    }
+
+    // Audit regressions: the git refs collection routes (list, namespace list, delete, update).
+    {
+      await call('POST', '/api/v3/user/repos', { name: 'audit-refs' });
+      const put1 = await call('PUT', `/api/v3/repos/${owner}/audit-refs/contents/f.txt`, { message: 'one', content: b64('one\n') });
+      eq('refs fixture commit', put1.status, 201);
+      const firstSha = put1.body?.commit?.sha;
+      const list = await call('GET', `/api/v3/repos/${owner}/audit-refs/git/refs`);
+      eq('refs list status', list.status, 200);
+      check('refs list names main', Array.isArray(list.body) && list.body.some((entry: any) => entry.ref === 'refs/heads/main'));
+      const ns = await call('GET', `/api/v3/repos/${owner}/audit-refs/git/refs/heads`);
+      eq('refs namespace list status', ns.status, 200);
+      check('refs namespace list names main', Array.isArray(ns.body) && ns.body.some((entry: any) => entry.ref === 'refs/heads/main'));
+      const made = await call('POST', `/api/v3/repos/${owner}/audit-refs/git/refs`, { ref: 'refs/heads/topic', sha: firstSha });
+      eq('ref create for delete/update', made.status, 201);
+      const put2 = await call('PUT', `/api/v3/repos/${owner}/audit-refs/contents/f.txt`, { message: 'two', content: b64('two\n'), sha: put1.body?.content?.sha });
+      eq('second commit on main', put2.status, 200);
+      const secondSha = put2.body?.commit?.sha;
+      const ff = await call('PATCH', `/api/v3/repos/${owner}/audit-refs/git/refs/heads/topic`, { sha: secondSha });
+      eq('ref fast-forward update', ff.status, 200);
+      const nonFf = await call('PATCH', `/api/v3/repos/${owner}/audit-refs/git/refs/heads/topic`, { sha: firstSha });
+      eq('ref non-fast-forward update refused', nonFf.status, 422);
+      const forced = await call('PATCH', `/api/v3/repos/${owner}/audit-refs/git/refs/heads/topic`, { sha: firstSha, force: true });
+      eq('ref forced update', forced.status, 200);
+      const del = await call('DELETE', `/api/v3/repos/${owner}/audit-refs/git/refs/heads/topic`);
+      eq('ref delete status', del.status, 204);
+      const gone = await call('GET', `/api/v3/repos/${owner}/audit-refs/git/refs/heads/topic`);
+      eq('deleted ref reads 404', gone.status, 404);
+      const delAgain = await call('DELETE', `/api/v3/repos/${owner}/audit-refs/git/refs/heads/topic`);
+      eq('deleting a missing ref is a 404', delAgain.status, 404);
+      const delDefault = await call('DELETE', `/api/v3/repos/${owner}/audit-refs/git/refs/heads/main`);
+      eq('deleting the default branch is a 422', delDefault.status, 422);
+    }
+
+    // Audit regressions: git data single-object reads and the empty tree.
+    {
+      const commit = await call('GET', `/api/v3/repos/${owner}/audit-refs/git/commits/${'placeholder'}`);
+      eq('git commit read of an unknown sha is a 404', commit.status, 404);
+      const list = await call('GET', `/api/v3/repos/${owner}/audit-refs/commits?per_page=1`);
+      const tipSha = list.body?.[0]?.sha;
+      const one = await call('GET', `/api/v3/repos/${owner}/audit-refs/git/commits/${tipSha}`);
+      eq('git commit read status', one.status, 200);
+      eq('git commit read sha', one.body?.sha, tipSha);
+      const contents = await call('GET', `/api/v3/repos/${owner}/audit-refs/contents/f.txt`);
+      const blob = await call('GET', `/api/v3/repos/${owner}/audit-refs/git/blobs/${contents.body?.sha}`);
+      eq('git blob read status', blob.status, 200);
+      eq('git blob read content', unb64(blob.body?.content ?? ''), 'two\n');
+      const blobOfCommit = await call('GET', `/api/v3/repos/${owner}/audit-refs/git/blobs/${tipSha}`);
+      eq('git blob read of a commit sha is a 404', blobOfCommit.status, 404);
+      const treeOfBlob = await call('GET', `/api/v3/repos/${owner}/audit-refs/git/trees/${contents.body?.sha}`);
+      eq('git tree read of a blob sha is a 404', treeOfBlob.status, 404);
+      const emptyRepo = store.createRepo(owner, 'audit-empty-tree', {});
+      const emptyTree = emptyRepo.git.makeTreeFromFiles(new Map());
+      const emptyCommit = emptyRepo.git.makeCommit(emptyTree, [], 'empty', `${VIEWER.name} <${VIEWER.email}> 1700000000 +0000`);
+      emptyRepo.git.refs.set('refs/heads/main', emptyCommit);
+      const empty = await call('GET', `/api/v3/repos/${owner}/audit-empty-tree/git/trees/${emptyTree}`);
+      eq('empty tree read status', empty.status, 200);
+      check('empty tree read lists no entries', Array.isArray(empty.body?.tree) && empty.body.tree.length === 0);
+    }
+
+    // Audit regressions: the commits list Link header names the true last page.
+    {
+      await call('POST', '/api/v3/user/repos', { name: 'audit-pages' });
+      let sha: string | undefined;
+      for (let i = 1; i <= 65; i += 1) {
+        const put = await call('PUT', `/api/v3/repos/${owner}/audit-pages/contents/f.txt`, { message: `c${i}`, content: b64(`v${i}\n`), ...(sha !== undefined ? { sha } : {}) });
+        sha = put.body?.content?.sha;
+      }
+      const page1 = await call('GET', `/api/v3/repos/${owner}/audit-pages/commits?per_page=30`);
+      const link = page1.headers.get('link') ?? '';
+      check('commits page 1 last link is page 3', /<[^>]*[?&]page=3>; rel="last"/.test(link), link);
+    }
+
+    // Audit regressions: merging a pull request whose head branch was deleted still lands
+    // the head's changes (the record's stored head sha is what merges).
+    {
+      await call('POST', '/api/v3/user/repos', { name: 'audit-delhead' });
+      await call('PUT', `/api/v3/repos/${owner}/audit-delhead/contents/a.txt`, { message: 'base', content: b64('base\n') });
+      const mainRef = await call('GET', `/api/v3/repos/${owner}/audit-delhead/git/refs/heads/main`);
+      await call('POST', `/api/v3/repos/${owner}/audit-delhead/git/refs`, { ref: 'refs/heads/topic', sha: mainRef.body?.object?.sha });
+      await call('PUT', `/api/v3/repos/${owner}/audit-delhead/contents/b.txt`, { message: 'topic work', content: b64('topic\n'), branch: 'topic' });
+      const pr = await call('POST', `/api/v3/repos/${owner}/audit-delhead/pulls`, { title: 'T', head: 'topic', base: 'main' });
+      eq('delhead pull created', pr.status, 201);
+      const del = await call('DELETE', `/api/v3/repos/${owner}/audit-delhead/git/refs/heads/topic`);
+      eq('delhead branch deleted', del.status, 204);
+      const merged = await call('PUT', `/api/v3/repos/${owner}/audit-delhead/pulls/${pr.body?.number}/merge`, {});
+      eq('delhead merge status', merged.status, 200);
+      eq('delhead merge merged flag', merged.body?.merged, true);
+      const landed = await call('GET', `/api/v3/repos/${owner}/audit-delhead/contents/b.txt`);
+      eq('delhead merge landed the head file', landed.status, 200);
+    }
+
     // Protocol: unknown route is a JSON 404, malformed JSON is a 400.
     const unknown = await call('GET', '/api/v3/no-such-route');
     eq('unknown route status', unknown.status, 404);
