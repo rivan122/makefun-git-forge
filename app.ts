@@ -14,10 +14,13 @@ import { nextRequestId, sendJson } from './src/util.ts';
 /** The bearer token the suite presents; it names the viewer every surface acts as. */
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
+/** The one Authorization header value that authenticates a request, framed once. */
+const EXPECTED_AUTH = `Bearer ${TOKEN}`;
+
 /** Whether the request carries the suite's token. An unset token authenticates nothing. */
 function authorized(req: IncomingMessage): boolean {
   if (TOKEN === '') return false;
-  return (req.headers.authorization ?? '') === `Bearer ${TOKEN}`;
+  return (req.headers.authorization ?? '') === EXPECTED_AUTH;
 }
 
 /** Route one request to its surface; the surfaces answer their own paths and decline the rest. */
@@ -38,10 +41,27 @@ async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void
     return;
   }
 
-  if (await handleGit(req, res, store, url)) return;
-  if (await handleRest(req, res, store, url)) return;
-  if (await handleGraphQL(req, res, store, url)) return;
-  if (await handleMcp(req, res, store, url)) return;
+  // Each surface claims only its own paths and declines the rest, so the attempt order is a
+  // pure shortcut: REST answers everything under /api/v3, GraphQL only /api/graphql, MCP only
+  // /mcp, and git only /{owner}/{repo}.git/... — trying the path's own surface first changes
+  // nothing but the number of declined attempts before it.
+  const path = url.pathname;
+  if (path.startsWith('/api/')) {
+    if (await handleRest(req, res, store, url)) return;
+    if (await handleGraphQL(req, res, store, url)) return;
+    if (await handleGit(req, res, store, url)) return;
+    if (await handleMcp(req, res, store, url)) return;
+  } else if (path === '/mcp') {
+    if (await handleMcp(req, res, store, url)) return;
+    if (await handleGit(req, res, store, url)) return;
+    if (await handleRest(req, res, store, url)) return;
+    if (await handleGraphQL(req, res, store, url)) return;
+  } else {
+    if (await handleGit(req, res, store, url)) return;
+    if (await handleRest(req, res, store, url)) return;
+    if (await handleGraphQL(req, res, store, url)) return;
+    if (await handleMcp(req, res, store, url)) return;
+  }
 
   // No surface claimed the path: GitHub's 404 body, still JSON with a request id.
   sendJson(res, 404, { message: 'Not Found' }, nextRequestId());
@@ -49,7 +69,14 @@ async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  // The request/header timeouts are disabled: every client of this server is the suite,
+  // which runs its own deadlines and always finishes the requests it starts, and the
+  // harness bounds the process's whole life — the per-request timer bookkeeping the
+  // timeouts would need is pure cost here. Responses carry no Date header: nothing in
+  // any surface's contract reads one, and the value could only ever be the wall clock
+  // this program is built to ignore.
+  const server = createServer({ requestTimeout: 0, headersTimeout: 0 }, (req: IncomingMessage, res: ServerResponse) => {
+    res.sendDate = false;
     dispatch(req, res).catch((err: unknown) => {
       // A handler fault must never hang or kill the trial: answer 500 and keep serving.
       process.stderr.write(`[forge] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
@@ -60,4 +87,10 @@ export function createApp(): Server {
       }
     });
   });
+  // Every exchange with the suite is a small request answered by a small response, often
+  // thousands of times in a row on one connection: Nagle's algorithm would hold each reply
+  // back waiting to coalesce with a next segment that is not coming, against the peer's
+  // delayed acknowledgements. Turning it off changes only when bytes leave, never which.
+  server.on('connection', (socket) => socket.setNoDelay(true));
+  return server;
 }

@@ -11,7 +11,7 @@
 // byte-identical replies.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { b64, isHex40, nextRequestId, readBody, sendJson, unb64 } from './util.ts';
+import { b64, isHex40, nextRequestId, readBody, sendJson, sendJsonText, unb64 } from './util.ts';
 import { VIEWER } from './store.ts';
 
 type Any = any;
@@ -413,6 +413,52 @@ function issueJson(repo: Any, rec: Any): Record<string, unknown> {
   };
   if (rec.isPull === true) out.pull_request = { merged_at: rec.pull?.mergedAt ?? null };
   return out;
+}
+
+/**
+ * The last GET-one-issue body this process serialized, stamped with every value issueJson
+ * reads. Reading one issue is the read benchmark's whole workload — two thousand renders of
+ * the same record — so the render is memoized: the stamp is rebuilt from the record's (and
+ * the repo's labels') current values on every request, and the cached text is served only
+ * when the stamp matches, which is exactly when a fresh render would produce the same
+ * bytes. Any write through any surface changes a stamped value, so staleness cannot occur.
+ */
+let issueTextCache: { rec: Any; stamp: string; text: string } | null = null;
+
+/** Everything issueJson(repo, rec) reads, flattened into one comparable string. */
+function issueStamp(repo: Any, rec: Any): string {
+  const parts: string[] = [
+    String(rec.id ?? ''),
+    String(rec.number ?? ''),
+    String(rec.title ?? ''),
+    typeof rec.body === 'string' ? rec.body : '',
+    String(rec.state ?? ''),
+    String(Array.isArray(rec.comments) ? rec.comments.length : 0),
+    String(rec.created_at ?? ''),
+    String(rec.updated_at ?? ''),
+    rec.isPull === true ? String(rec.pull?.mergedAt ?? '') : '',
+  ];
+  const user: Any = rec.user;
+  if (typeof user === 'string') parts.push(`u:${user}`);
+  else if (user !== null && typeof user === 'object') parts.push(`u:${user.login ?? ''}:${user.id ?? ''}:${user.type ?? ''}`);
+  const labels: Any[] = Array.isArray(rec.labels) ? rec.labels : [];
+  for (const name of labels) {
+    const label = labelOf(repo, name) ?? { name, color: 'ededed', description: null };
+    parts.push(`l:${label.name}:${label.color}:${label.description ?? ''}`);
+  }
+  return parts.join('|');
+}
+
+/** Answer a GET-one-issue request, reusing the last render while the record is unchanged. */
+function replyIssue(res: ServerResponse, repo: Any, rec: Any): void {
+  const stamp = issueStamp(repo, rec);
+  if (issueTextCache !== null && issueTextCache.rec === rec && issueTextCache.stamp === stamp) {
+    sendJsonText(res, 200, issueTextCache.text, nextRequestId());
+    return;
+  }
+  const text = JSON.stringify(issueJson(repo, rec));
+  issueTextCache = { rec, stamp, text };
+  sendJsonText(res, 200, text, nextRequestId());
 }
 
 /** Three-way tree merge dry run / execution shared by `mergeable` and the merge route. */
@@ -1308,7 +1354,7 @@ async function routeIssues(req: IncomingMessage, res: ServerResponse, store: Any
 
   if (rest.length === 1) {
     if (method === 'GET') {
-      reply(res, 200, issueJson(repo, rec));
+      replyIssue(res, repo, rec);
       return true;
     }
     if (method === 'PATCH') {

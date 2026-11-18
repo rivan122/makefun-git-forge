@@ -136,7 +136,8 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('end', () => {
       if (settled) return;
       settled = true;
-      resolve(Buffer.concat(chunks));
+      // The common body arrives as one chunk; concat would only copy it.
+      resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks));
     });
     req.on('error', (err) => {
       if (settled) return;
@@ -166,6 +167,28 @@ export function sendJson(
     'x-github-request-id': requestId,
   });
   res.end(text);
+}
+
+/**
+ * Answer with a JSON body the caller already serialized: the same wire bytes sendJson would
+ * produce for the value (the text plus a trailing newline, the same three standard headers),
+ * without paying to serialize it again.
+ */
+export function sendJsonText(
+  res: ServerResponse,
+  status: number,
+  text: string,
+  requestId: string,
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  const body = `${text}\n`;
+  res.writeHead(status, {
+    ...headers,
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(body),
+    'x-github-request-id': requestId,
+  });
+  res.end(body);
 }
 
 let requestCounter = 0;
