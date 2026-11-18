@@ -714,7 +714,11 @@ async function createRepo(req: IncomingMessage, res: ServerResponse, store: Any)
     return true;
   }
   if (store.getRepo(VIEWER.login, name)) {
-    fail(res, 422, 'Repository creation failed.');
+    // GitHub's duplicate-create shape: the errors entry is what idempotent callers match on.
+    reply(res, 422, {
+      message: 'Repository creation failed.',
+      errors: [{ resource: 'Repository', code: 'custom', field: 'name', message: 'name already exists on this account' }],
+    });
     return true;
   }
   const repo = store.createRepo(VIEWER.login, name, {
