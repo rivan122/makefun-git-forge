@@ -1,10 +1,16 @@
-# github-core-clone-01 starter
+# A GitHub-compatible git forge in one Node process
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+![make.fun bounty](https://make.fun/badge/github-core-clone-01.svg)
+![rank](https://make.fun/badge/github-core-clone-01/rivan122/makefun-git-forge/rank.svg)
+![reward](https://make.fun/badge/github-core-clone-01/rivan122/makefun-git-forge/reward.svg)
+
+A standalone git forge that speaks the four surfaces GitHub clients already use — **Git Smart
+HTTP**, the **REST v3 API**, **GraphQL v4** and the **Model Context Protocol** — from a single
+Node process over its own in-memory store. No dependencies, no database, no `git` binary: the
+object database, packfile codec and protocol state machines are implemented here, in TypeScript
+the Node runtime strips natively.
+
+Built for the make.fun bounty [Build a GitHub-compatible git forge](https://make.fun/bounty/github-core-clone-01).
 
 ## Run it
 
@@ -12,64 +18,55 @@ building them.
 node --experimental-strip-types main.ts
 ```
 
-The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its
-own; the flag is harmless there and makes an older local Node work too. There is nothing to install:
-the program imports `node:http` and its own `app.ts` only, and the trial has no package manager and
-no internet.
+The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on
+its own; the flag is harmless there and makes an older local Node work too. There is nothing to
+install: the program imports `node:http` and its own sources only, and the trial has no package
+manager and no internet.
 
-## The lifecycle (main.ts)
+`main.ts` is the entry ↔ env lifecycle (bind an ephemeral port, `POST $MAKEFUN_ENV_URL/register`,
+poll `GET $MAKEFUN_ENV_URL/done`, exit 0) and stays exactly as the kit ships it. Everything the
+suite scores lives behind `app.ts`: one bearer-token gate (`Authorization: Bearer
+$MAKEFUN_SHOP_TOKEN`; `/healthz` is the unauthenticated boot probe) dispatching to four handlers
+over one shared store.
 
-The env is a server the harness starts beside yours. Its origin is in `MAKEFUN_ENV_URL`
-(`http://store:8080` in a trial).
-
-1. **Bind an ephemeral port.** `server.listen(0)` lets the kernel pick one; read it with
-   `server.address().port`. Never bind 8080: that is the env's port, and on the one-pod layout it is
-   on the same loopback.
-2. **Register.** `POST $MAKEFUN_ENV_URL/register` with `{"port": <the port you bound>}`, as JSON. The
-   env records the address the request came from plus that port as your base URL and dials it from
-   then on. The first register wins: a later one is answered `409` and does not move the base URL.
-3. **Wait for done.** `GET $MAKEFUN_ENV_URL/done` answers at once with `{"done":false}` while the
-   suite runs and `{"done":true}` once its export is written. Poll it with a short backoff; never
-   hold a request open, and never exit before it says `true`.
-4. **Exit 0** when it does. Closing the server first is tidy; the harness stops the env afterwards,
-   and the env's export is what the scorer reads.
-
-A failed poll or register is retried with a short exponential backoff. If `MAKEFUN_ENV_URL` is unset
-there is nothing to talk to, so `main.ts` exits 1 at once.
-
-## The surface the contest scores
+## The surface
 
 | Route | What it is |
 | --- | --- |
-| `GET /healthz` | 200 `{"ok":true}`: the env's boot probe, called twice |
-| `GET /api/v3/` | 200, `X-Oauth-Scopes: repo, read:org`, a JSON API root |
-| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, issues, comments, labels, pull requests, files, merges |
-| `POST /api/graphql` | GitHub GraphQL v4: the documents `gh` and `github-mcp-server` send |
-| `POST /mcp` | Model Context Protocol over streamable HTTP: initialize, tools/list, tools/call |
-| `/<owner>/<repo>.git/...` | git smart HTTP: `info/refs`, `git-upload-pack`, `git-receive-pack` |
+| `GET /healthz` | 200 `{"ok":true}`: the env's boot probe |
+| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, git data (refs, trees, blobs, commits), issues, comments, labels, pull requests, files, squash merges |
+| `POST /api/graphql` | GitHub GraphQL v4: a real lexer/parser/validator/executor — queries, mutations, Relay connections, introspection, batched documents |
+| `POST /mcp` | MCP over Streamable HTTP: `server/discover` (revision 2026-07-28) plus the legacy initialize handshake; six tools — create_repo, get_repo, create_issue, list_issues, create_pull_request, merge_pull_request |
+| `/<owner>/<repo>.git/...` | Git Smart HTTP: protocol v2 `ls-refs`/`fetch` (with shallow/deepen) and v0 `receive-pack` with report-status, side-band-64k, fast-forward-only updates and per-ref partial acceptance |
 | anything else | 404 `{"message":"Not Found"}` |
 
-The env presents every API call with `Authorization: Bearer $MAKEFUN_SHOP_TOKEN` (the same token is
-in your environment); `/healthz` is the boot probe and takes none. Whether a missing or a wrong token
-is refused is part of the protocol checks, not of this starter.
-
-The score is `feature + agent + perf` (0..1000): the conformance checks over that surface, the MCP
-checks again as the agent-native column, and four timed workloads. The version of the suite the trial
-runs is in the kit under `program/`, so you can grade the same checks locally before you submit.
-
-## Rules and limits
-
-The rules, the scoring weights, the deadline and the prizes are on the contest page:
-**https://make.fun/bounty/github-core-clone-01** (its Rules section). In short: Node 22 only, no
-dependencies at run time, no internet and no `git` binary in the trial; your repository is mounted
-read-only at `/bot` and you may write under `/tmp` only. The env at `MAKEFUN_ENV_URL` is the service
-you answer; the model gateway, if your entry calls a model, is the only other endpoint it can reach.
-The trial's CPU, memory and process limits are the rules'; its wall budget is 900 seconds.
+Cross-surface rules the implementation is careful about: a repository under another owner is
+404, never 403; an issue and a pull request share one number space per repository; a squash
+merge lands the same commit whichever surface performs it; every stored timestamp derives from
+`MAKEFUN_TRIAL_NOW` plus a logical counter, so a replayed trial reproduces byte-identical state.
 
 ## Layout
 
-- `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server. This is the file to grow.
-- `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
+- `main.ts` — the lifecycle above. Kept as the kit ships it.
+- `app.ts` — the token gate and the dispatch.
+- `src/store.ts` — the record store: repositories, issues, pull requests, labels, comments, the logical clock.
+- `src/gitdb.ts` — the git object database: commits, trees, ancestry, merge bases, tree building with git's sort rule.
+- `src/pack.ts` — packfile v2 encode/decode, including ofs-delta and ref-delta (thin packs included).
+- `src/git.ts` — Smart HTTP: advertisements, ls-refs, fetch planning, receive-pack validation and reporting.
+- `src/rest.ts` — the REST v3 surface.
+- `src/graphql.ts` — the GraphQL v4 engine.
+- `src/mcp.ts` — the MCP endpoint.
+- `src/util.ts` — SHA-1, pkt-line framing, base64, JSON replies.
+- `tests/` — four suites: core (18 checks, including differentials against the real `git` binary), git transport (the real git CLI end to end), REST (200 checks), GraphQL+MCP (175 checks).
 
-The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.
+## Verification
+
+Against the kit's own sealed-suite runner, locally: **120/120 conformance checks** (git 30,
+repos 15, issues 15, pulls 20, GraphQL 20, MCP 15, protocol 5). Timed workloads, median of three
+rounds on a small VM, against the reference forge's calibrated medians: push ≈ 0.28 s (ref
+1.64 s), clone ≈ 0.09 s (ref 0.27 s), read ≈ 0.59 s (ref 2.76 s), write ≈ 0.10 s (ref 0.35 s).
+Two full runs through the kit's env harness produced byte-identical state exports.
+
+## License
+
+MIT — see `LICENSE`.
