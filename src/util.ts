@@ -30,8 +30,10 @@ export function pktLine(payload: Buffer | string): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const length = body.length + 4;
   if (length > 0xffff) throw new Error(`pkt-line payload of ${body.length} bytes is too large`);
-  const prefix = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([prefix, body]);
+  const framed = Buffer.allocUnsafe(length);
+  framed.write(length.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  body.copy(framed, 4);
+  return framed;
 }
 
 /** The flush packet: ends a section of a pkt-line stream. */

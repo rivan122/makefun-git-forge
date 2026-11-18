@@ -201,6 +201,32 @@ function buildPack(git: GitRepo, send: ReadonlySet<string>): Buffer {
   return encodePack(objects);
 }
 
+/**
+ * Sideband-wrapped pack segments by their object set, framed once per distinct set. A pack
+ * is a pure function of the objects it carries, and object ids are content hashes — so a
+ * given id set yields the same segment bytes from any repository, forever, and a cache hit
+ * is byte-identical to a rebuild. Only small segments are kept (the repeated shallow-fetch
+ * shape); the cache clears itself when full rather than growing without bound. Callers
+ * only read the returned buffers.
+ */
+const packSegmentCache = new Map<string, Buffer[]>();
+const PACK_SEGMENT_CACHE_MAX_ENTRIES = 256;
+const PACK_SEGMENT_CACHE_MAX_BYTES = 64 * 1024;
+
+/** The sideband packets carrying `send`'s pack, memoized by the object id set. */
+function packSegment(git: GitRepo, send: ReadonlySet<string>): Buffer[] {
+  const key = [...send].sort().join(' ');
+  const cached = packSegmentCache.get(key);
+  if (cached) return cached;
+  const segment = sidebandPackets(buildPack(git, send));
+  const bytes = segment.reduce((total, packet) => total + packet.length, 0);
+  if (bytes <= PACK_SEGMENT_CACHE_MAX_BYTES) {
+    if (packSegmentCache.size >= PACK_SEGMENT_CACHE_MAX_ENTRIES) packSegmentCache.clear();
+    packSegmentCache.set(key, segment);
+  }
+  return segment;
+}
+
 // ---------------------------------------------------------------------------------------------
 // advertisements
 // ---------------------------------------------------------------------------------------------
@@ -236,17 +262,21 @@ function v0Advertisement(git: GitRepo, service: 'git-upload-pack' | 'git-receive
 }
 
 /** The v2 capability advertisement: service preamble, then "version 2" and one line per capability. */
+// The v2 advertisement names no repository state, so its bytes are the same for every
+// request and are framed once. Callers only read the buffer (sendBytes hands it to res.end).
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 /** GET info/refs: the advertisement for the named service, or 404 for anything else. */
@@ -587,7 +617,7 @@ function fetchV2(res: ServerResponse, git: GitRepo, args: FetchArgs): void {
     parts.push(PKT_DELIM);
   }
   parts.push(pktLine('packfile\n'));
-  parts.push(...sidebandPackets(buildPack(git, plan.send)));
+  parts.push(...packSegment(git, plan.send));
   parts.push(PKT_FLUSH);
   sendBytes(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
 }
@@ -733,7 +763,7 @@ function uploadPackV0(res: ServerResponse, git: GitRepo, body: Buffer): void {
   } else {
     parts.push(pktLine(`ACK ${known[known.length - 1]}\n`));
   }
-  if (plan !== null) parts.push(...sidebandPackets(buildPack(git, plan.send)));
+  if (plan !== null) parts.push(...packSegment(git, plan.send));
   parts.push(PKT_FLUSH);
   sendBytes(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
 }
@@ -766,6 +796,37 @@ interface PushCommand {
 /** A combined view of the repository plus a push's staged objects, for validation walks. */
 type ObjectView = (sha: string) => ObjectLike | undefined;
 
+/**
+ * Parses of commit headers and tree entries by object id, shared by the validation walks.
+ * Object ids are content hashes, so an id's parse is the same wherever the object came from
+ * (the repository or a push's staging), and the walks below re-read the same history objects
+ * on every push. Callers treat the returned values as read-only.
+ */
+const headerParseCache = new Map<string, { tree: string | null; parents: string[] }>();
+const treeParseCache = new Map<string, Array<{ mode: string; name: string; sha: string }>>();
+
+/** The parsed commit header of the view's object at `sha` (cached by id). */
+function viewCommitHeader(view: ObjectView, sha: string): { tree: string | null; parents: string[] } | null {
+  const cached = headerParseCache.get(sha);
+  if (cached) return cached;
+  const obj = view(sha);
+  if (!obj || obj.type !== 'commit') return null;
+  const header = parseCommitHeader(obj.data);
+  headerParseCache.set(sha, header);
+  return header;
+}
+
+/** The parsed entries of the view's tree at `sha` (cached by id), or null when not a tree. */
+function viewTreeEntries(view: ObjectView, sha: string): Array<{ mode: string; name: string; sha: string }> | null {
+  const cached = treeParseCache.get(sha);
+  if (cached) return cached;
+  const obj = view(sha);
+  if (!obj || obj.type !== 'tree') return null;
+  const entries = parseTreeEntries(obj.data);
+  treeParseCache.set(sha, entries);
+  return entries;
+}
+
 /** Follow tag objects in the combined view until a non-tag object. */
 function peelTagView(view: ObjectView, sha: string): string {
   let current = sha;
@@ -790,15 +851,15 @@ function isAncestorView(view: ObjectView, ancestor: string, descendant: string):
     if (current === ancestor) return true;
     if (seen.has(current)) continue;
     seen.add(current);
-    const obj = view(current);
-    if (!obj || obj.type !== 'commit') continue;
-    queue.push(...parseCommitHeader(obj.data).parents);
+    const header = viewCommitHeader(view, current);
+    if (!header) continue;
+    queue.push(...header.parents);
   }
   return false;
 }
 
 /** Add every object reachable from `tips` in the combined view to `into`. */
-function closureView(view: ObjectView, tips: string[], into: Set<string>): void {
+function closureView(git: GitRepo, view: ObjectView, tips: string[], into: Set<string>): void {
   const stack = [...tips];
   while (stack.length > 0) {
     const sha = stack.pop() as string;
@@ -806,12 +867,20 @@ function closureView(view: ObjectView, tips: string[], into: Set<string>): void 
     const obj = view(sha);
     if (!obj) continue;
     into.add(sha);
+    // A closed id's closure is already entirely in the repository (gitdb.ts), and staged
+    // objects are by construction not in the repository — so nothing the caller is
+    // collecting can sit below a closed id, and the walk need not descend into it. The id
+    // itself is still collected, exactly as the unpruned walk collects it.
+    if (git.isClosed(sha)) continue;
     if (obj.type === 'commit') {
-      const header = parseCommitHeader(obj.data);
-      if (header.tree) stack.push(header.tree);
-      stack.push(...header.parents);
+      const header = viewCommitHeader(view, sha);
+      if (header) {
+        if (header.tree) stack.push(header.tree);
+        stack.push(...header.parents);
+      }
     } else if (obj.type === 'tree') {
-      for (const entry of parseTreeEntries(obj.data)) stack.push(entry.sha);
+      const entries = viewTreeEntries(view, sha);
+      if (entries) for (const entry of entries) stack.push(entry.sha);
     } else if (obj.type === 'tag') {
       const target = tagTarget(obj.data);
       if (target) stack.push(target);
@@ -926,12 +995,18 @@ function receivePackBody(res: ServerResponse, git: GitRepo, body: Buffer): void 
     .filter((result) => result.ok && result.command.newOid !== ZERO_OID)
     .map((result) => result.command.newOid);
   const needed = new Set<string>();
-  closureView(view, acceptedTips, needed);
+  closureView(git, view, acceptedTips, needed);
   for (const sha of needed) {
     if (git.has(sha)) continue;
     const obj = staged.get(sha);
-    if (obj && OBJ_TYPES.has(obj.type)) git.store(obj.type as ObjType, obj.data);
+    // The staged map is keyed by the id decodePack computed for these exact bytes, so the
+    // store files them under that id instead of hashing the bytes a second time.
+    if (obj && OBJ_TYPES.has(obj.type)) git.storeKnown(sha, obj.type as ObjType, obj.data);
   }
+  // Every member of `needed` is now in the repository (it came from the repository or was
+  // just stored), and each member's own closure lies inside `needed` — so every member's
+  // closure is stored, which is exactly what markClosed records for later walks.
+  git.markClosed(needed);
   for (const result of results) {
     if (!result.ok) continue;
     if (result.command.newOid === ZERO_OID) git.refs.delete(result.command.ref);

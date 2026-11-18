@@ -88,11 +88,40 @@ export class GitRepo {
   objects: Map<string, StoredObject>;
   refs: Map<string, string>;
   headRef: string;
+  /**
+   * Parsed views of stored commits and trees, by object id. Stored objects are immutable
+   * (store never replaces an id's bytes), so a parse stays valid for the object's lifetime;
+   * callers treat the returned records as read-only.
+   */
+  private commitCache: Map<string, CommitRec>;
+  private treeCache: Map<string, TreeEntry[]>;
+  /**
+   * Ids whose whole reachable closure is known to be stored here. A walk that reaches a
+   * closed id need not descend: everything below it is already in the store, so nothing a
+   * caller is looking for (e.g. a push's staged objects) can hide underneath it. Blobs are
+   * closed by definition; receive-pack marks the closure it materializes (see git.ts).
+   * Objects written through the REST git-data routes are never marked — their entries may
+   * name ids this store does not hold — so walks still descend into them.
+   */
+  private closed: Set<string>;
 
   constructor(headRef = 'refs/heads/main') {
     this.objects = new Map();
     this.refs = new Map();
     this.headRef = headRef;
+    this.commitCache = new Map();
+    this.treeCache = new Map();
+    this.closed = new Set();
+  }
+
+  /** True when `sha`'s whole reachable closure is known to be stored here. */
+  isClosed(sha: string): boolean {
+    return this.closed.has(sha);
+  }
+
+  /** Record that each id's whole reachable closure is now stored here. */
+  markClosed(shas: Iterable<string>): void {
+    for (const sha of shas) this.closed.add(sha);
   }
 
   /** True when the object is stored. */
@@ -104,6 +133,14 @@ export class GitRepo {
   store(type: ObjType, data: Buffer): string {
     const sha = gitObjectSha(type, data);
     if (!this.objects.has(sha)) this.objects.set(sha, { type, data });
+    if (type === 'blob') this.closed.add(sha);
+    return sha;
+  }
+
+  /** Store an object's raw bytes under an id the caller already computed; returns the id. */
+  storeKnown(sha: string, type: ObjType, data: Buffer): string {
+    if (!this.objects.has(sha)) this.objects.set(sha, { type, data });
+    if (type === 'blob') this.closed.add(sha);
     return sha;
   }
 
@@ -114,16 +151,24 @@ export class GitRepo {
 
   /** The parsed commit at `sha`, or undefined when absent or not a commit. */
   commit(sha: string): CommitRec | undefined {
+    const cached = this.commitCache.get(sha);
+    if (cached) return cached;
     const obj = this.objects.get(sha);
     if (!obj || obj.type !== 'commit') return undefined;
-    return parseCommit(obj.data);
+    const rec = parseCommit(obj.data);
+    if (rec) this.commitCache.set(sha, rec);
+    return rec;
   }
 
   /** The parsed tree at `sha`, or undefined when absent or not a tree. */
   tree(sha: string): TreeEntry[] | undefined {
+    const cached = this.treeCache.get(sha);
+    if (cached) return cached;
     const obj = this.objects.get(sha);
     if (!obj || obj.type !== 'tree') return undefined;
-    return parseTree(obj.data);
+    const entries = parseTree(obj.data);
+    this.treeCache.set(sha, entries);
+    return entries;
   }
 
   /** Store file contents as a blob; returns its id. */

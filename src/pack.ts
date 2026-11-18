@@ -220,7 +220,7 @@ export function decodePack(
     if (inflated.data.length !== size) {
       throw new Error(`pack entry at ${entryOffset} inflated to ${inflated.data.length} bytes, header says ${size}`);
     }
-    entries.push({ offset: entryOffset, typeCode, size, data: Buffer.from(inflated.data), baseOffset, baseSha });
+    entries.push({ offset: entryOffset, typeCode, size, data: inflated.data, baseOffset, baseSha });
   }
   if (offset !== trailerStart) throw new Error('pack has bytes unaccounted for before its trailer');
 
